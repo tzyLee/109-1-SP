@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,9 +32,11 @@ typedef struct {
     int wait_for_write;  // used by handle_read to know if the header is read or not.
 } request;
 
-server svr;                // server
-request* requestP = NULL;  // point to a list of requests
-int maxfd;                 // size of open file descriptor table, size of request list
+server svr;                 // server
+request* requestP = NULL;   // point to a list of requests
+int maxfd;                  // size of open file descriptor table, size of request list
+struct pollfd* fds = NULL;  // point to a list of pollfds
+int fds_len = 0;            // number of pollfds used in fds
 
 const char* accept_read_header = "ACCEPT_FROM_READ";
 const char* accept_write_header = "ACCEPT_FROM_WRITE";
@@ -47,6 +50,14 @@ static void init_request(request* reqP);
 static void free_request(request* reqP);
 // free resources used by a request instance
 
+static void block_and_accept_connection(int sockfd, struct sockaddr_in* cliaddrp, int* clilen);
+
+static void append_fd(int fd);
+// append a fd to the end of fds
+
+static void remove_fd(int idx);
+// remove fds[idx]
+
 typedef struct {
     int id;  //customer id
     int adultMask;
@@ -55,9 +66,12 @@ typedef struct {
 
 int handle_read(request* reqP) {
     char buf[512];
-    read(reqP->conn_fd, buf, sizeof(buf));
-    memcpy(reqP->buf, buf, strlen(buf));
-    return 0;
+    int nRead = read(reqP->conn_fd, buf, sizeof(buf));
+    if (nRead < 512) {
+        buf[nRead] = '\0';
+    }
+    strncpy(reqP->buf, buf, 512);
+    return nRead;
 }
 
 int main(int argc, char** argv) {
@@ -68,60 +82,122 @@ int main(int argc, char** argv) {
     }
 
     struct sockaddr_in cliaddr;  // used by accept()
-    int clilen;
+    int clilen = sizeof(cliaddr);
 
     int conn_fd;  // fd for a new connection with client
     int file_fd;  // fd for file that we open for reading
     char buf[512];
     int buf_len;
+    int total_fd;  // number of fds that are ready for reading
 
     // Initialize server
     init_server((unsigned short)atoi(argv[1]));
 
+    fds = (struct pollfd*)malloc(sizeof(struct pollfd) * maxfd);
+    fds_len = 0;
+
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
+    append_fd(svr.listen_fd);
+    fds[0].events = POLLIN;  // check for incoming connections
+
     while (1) {
         // TODO: Add IO multiplexing
-
-        // Check new connection
-        clilen = sizeof(cliaddr);
-        conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
-        if (conn_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN)
-                continue;  // try again
-            if (errno == ENFILE) {
-                (void)fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
-                continue;
+        if (fds_len == 1) {
+            // No pending requests, check for new connection
+            block_and_accept_connection(svr.listen_fd, &cliaddr, &clilen);
+        } else {
+            // Has Pending requests
+            if ((total_fd = poll(fds, fds_len, 1000)) < 0) {
+                ERR_EXIT("poll");
             }
-            ERR_EXIT("accept");
-        }
-        requestP[conn_fd].conn_fd = conn_fd;
-        strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
-
-        int ret = handle_read(&requestP[conn_fd]);  // parse data from client to requestP[conn_fd].buf
-        if (ret < 0) {
-            fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
-            continue;
-        }
-
-        // TODO: handle requests from clients
+            if (total_fd == 0)
+                continue;
+            // Check for incoming connection
+            // prevents the server from blocked by waiting for sockets to answer
+            if (fds[0].revents != 0) {
+                block_and_accept_connection(svr.listen_fd, &cliaddr, &clilen);
+                fds[0].revents = 0;
+                if (--total_fd == 0)
+                    continue;
+            }
+            // TODO: handle requests from clients
+            for (int i = 1; i < fds_len;) {
+                if (fds[i].revents == 0) {
+                    ++i;
+                    continue;
+                }
+                int fd = fds[i].fd;
+                int ret = handle_read(&requestP[fd]);  // parse data from client to requestP[conn_fd].buf
+                if (ret < 0) {
+                    fprintf(stderr, "bad request from %s\n", requestP[fd].host);
+                    continue;
+                }
+                fprintf(stderr, "handling request %d, %d can be read\n", i, total_fd);
 #ifdef READ_SERVER
-        fprintf(stderr, "%s", requestP[conn_fd].buf);
-        sprintf(buf, "%s : %s", accept_read_header, requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                fprintf(stderr, "%s", requestP[fd].buf);
+                sprintf(buf, "%s : %s", accept_read_header, requestP[fd].buf);
+                write(requestP[fd].conn_fd, buf, strlen(buf));
 #else
-        fprintf(stderr, "%s", requestP[conn_fd].buf);
-        sprintf(buf, "%s : %s", accept_write_header, requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));
+                fprintf(stderr, "%s", requestP[fd].buf);
+                sprintf(buf, "%s : %s", accept_write_header, requestP[fd].buf);
+                write(requestP[fd].conn_fd, buf, strlen(buf));
 #endif
-
-        close(requestP[conn_fd].conn_fd);
-        free_request(&requestP[conn_fd]);
+                close(requestP[fd].conn_fd);
+                free_request(&requestP[fd]);
+                remove_fd(i);
+                if (--total_fd == 0)
+                    break;
+            }
+        }
     }
     free(requestP);
+    free(fds);
+    fds = NULL;  // clear dangling pointer
     return 0;
+}
+
+// ======================================================================================================
+static void block_and_accept_connection(int sockfd, struct sockaddr_in* cliaddrp, int* clilen) {
+    int conn_fd = 0;
+    do {
+        conn_fd = accept(sockfd, (struct sockaddr*)cliaddrp, (socklen_t*)clilen);
+        // success
+        if (conn_fd >= 0)
+            break;
+        // error
+        switch (errno) {
+        case EINTR:
+        case EAGAIN:
+            continue;  // try again
+        case ENFILE:
+            (void)fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
+            return;  // Stop accept new connection to allow the requests to be done
+        default:
+            ERR_EXIT("accept");
+        }
+    } while (1);
+    requestP[conn_fd].conn_fd = conn_fd;
+    strcpy(requestP[conn_fd].host, inet_ntoa(cliaddrp->sin_addr));
+    append_fd(conn_fd);
+    fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+}
+
+static void append_fd(int fd) {
+    // assume 0 <= fds_len < maxfds;
+    fds[fds_len].fd = fd;
+    fds[fds_len].events = POLLIN | POLLHUP;  // can be read or hung up
+    fds[fds_len].revents = 0;
+    ++fds_len;
+}
+
+static void remove_fd(int idx) {
+    // assume 0 <= fds_len < maxfds;
+    if (idx != fds_len - 1) {
+        memcpy(fds + idx, fds + fds_len - 1, sizeof(struct pollfd));
+    }
+    --fds_len;
 }
 
 // ======================================================================================================
