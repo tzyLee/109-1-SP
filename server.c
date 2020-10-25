@@ -426,12 +426,20 @@ static Result handleOrder(Request* req) {
 
     int orderChild = 0;
     int orderAdult = 0;
-    if (sscanf(req->buf, "adult %d", &orderAdult) != 1 &&
-        sscanf(req->buf, "children %d", &orderChild) != 1) {
+    int nRead = 0;
+    if (sscanf(req->buf, "adult %d%n", &orderAdult, &nRead) != 1 &&
+        sscanf(req->buf, "children %d%n", &orderChild, &nRead) != 1) {
         // no valid command
         releaseLock(req, idx);
         return FAILED;
     }
+
+    for (int i = req->buf_len - 1; i >= nRead; --i)
+        if (!isspace(req->buf[i])) {
+            // check for extra character(s)
+            releaseLock(req, idx);
+            return FAILED;
+        }
 #ifndef NDEBUG
     fprintf(stderr, "Ordered adult: %d, children: %d\n", orderAdult,
             orderChild);
@@ -478,11 +486,12 @@ static Result handleOrder(Request* req) {
         return FAILED;
 
     if (orderAdult) {
-        sprintf(buf, "Pre-order for %d succeed, %d adult mask(s) ordered.\n",
+        sprintf(buf, "Pre-order for %d successed, %d adult mask(s) ordered.\n",
                 req->id, orderAdult);
 
     } else {
-        sprintf(buf, "Pre-order for %d succeed, %d children mask(s) ordered.\n",
+        sprintf(buf,
+                "Pre-order for %d successed, %d children mask(s) ordered.\n",
                 req->id, orderChild);
     }
     write(req->conn_fd, buf, strlen(buf));
