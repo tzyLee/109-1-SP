@@ -107,11 +107,12 @@ static Result handleOrder(Request*);
 // action taken when a file is ready to be read
 Action actions[] = {
     {.prompt = NULL, .handler = startRequest},
-    {.prompt = "Please enter the id (to check how many masks can be ordered):",
+    {.prompt =
+         "Please enter the id (to check how many masks can be ordered):\n",
      .handler = lookUpRecord},
 #ifndef READ_SERVER
     {.prompt = "Please enter the mask type (adult or children) and number of "
-               "mask you would like to order:",
+               "mask you would like to order:\n",
      .handler = handleOrder},
 #endif
 };
@@ -477,12 +478,11 @@ static Result handleOrder(Request* req) {
         return FAILED;
 
     if (orderAdult) {
-        sprintf(buf, "Pre-order for %d succeeded, %d adult mask(s) ordered.\n",
+        sprintf(buf, "Pre-order for %d succeed, %d adult mask(s) ordered.\n",
                 req->id, orderAdult);
 
     } else {
-        sprintf(buf,
-                "Pre-order for %d succeeded, %d children mask(s) ordered.\n",
+        sprintf(buf, "Pre-order for %d succeed, %d children mask(s) ordered.\n",
                 req->id, orderChild);
     }
     write(req->conn_fd, buf, strlen(buf));
