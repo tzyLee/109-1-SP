@@ -14,15 +14,11 @@ int retCode = 0;
         exit(retCode);   \
     } while (0)
 
-/// @brief Fork a subprocess and run the given program with `argv`, and use pipe
-/// to communicate between child and parent
-/// @param pathname path to the program for child to run
-/// @param argv     argv sent to the program
-/// @param pid      the pid of child
+/// @brief Fork a subprocess and open FILE* for parent to read/write to child
+/// @returns pid    the pid
 /// @param inFile   file read from stdout of child
 /// @param outFile  file write to stdin of child
-void run(const char* pathname, char* const argv[], int* pid, FILE** inFile,
-         FILE** outFile) {
+int forkAndRedirect(FILE** inFile, FILE** outFile) {
     int fd[2][2] = {0};
     // fd[0]: parent(fd[0][0]) <- child(fd[0][1])
     // fd[1]: parent(fd[1][1]) -> child(fd[1][0])
@@ -31,9 +27,10 @@ void run(const char* pathname, char* const argv[], int* pid, FILE** inFile,
         ERR_EXIT("Error opening pipe");
     }
 
-    if ((*pid = fork()) < 0) {
+    int pid = fork();
+    if (pid < 0) {
         ERR_EXIT("Error forking");
-    } else if (*pid == 0) {
+    } else if (pid == 0) {
         // Child
         if (inFile != NULL) {
             close(fd[0][0]);
@@ -53,10 +50,6 @@ void run(const char* pathname, char* const argv[], int* pid, FILE** inFile,
                 close(fd[1][0]);
             }
         }
-        if (execv(pathname, argv) < 0) {
-            ERR_EXIT("Execv error");
-        }
-        _exit(0);
     } else {
         // Parent
         if (inFile != NULL) {
@@ -68,6 +61,7 @@ void run(const char* pathname, char* const argv[], int* pid, FILE** inFile,
             *outFile = fdopen(fd[1][1], "w");
         }
     }
+    return pid;
 }
 
 void scoreToRank(int n, const int* score, int* rank) {
@@ -98,8 +92,22 @@ int main(int argc, char* const argv[]) {
         char* const child_argv[] = {"./host", argv[1], argv[2], num_buf, NULL};
         snprintf(num_buf, sizeof(num_buf), "%d", depth + 1);
         // fork 2 hosts
-        run("./host", child_argv, &pid[0], &files[0][0], &files[0][1]);
-        run("./host", child_argv, &pid[1], &files[1][0], &files[1][1]);
+        pid[0] = forkAndRedirect(&files[0][0], &files[0][1]);
+        if (pid[0] == 0) {
+            // Child
+            if (execv("./host", child_argv) < 0) {
+                ERR_EXIT("Execv error");
+            }
+        }
+        pid[1] = forkAndRedirect(&files[1][0], &files[1][1]);
+        if (pid[1] == 0) {
+            fclose(files[0][0]);
+            fclose(files[0][1]);
+            // Child
+            if (execv("./host", child_argv) < 0) {
+                ERR_EXIT("Execv error");
+            }
+        }
     }
 
     if (depth == 0) {
@@ -130,9 +138,22 @@ int main(int argc, char* const argv[]) {
             char* const child_argv[] = {"./player", num_buf, NULL};
             // fork 2 players
             snprintf(num_buf, sizeof(num_buf), "%d", player_id[0]);
-            run("./player", child_argv, &pid[0], &files[0][0], NULL);
+            pid[0] = forkAndRedirect(&files[0][0], NULL);
+            if (pid[0] == 0) {
+                // Child
+                if (execv("./player", child_argv) < 0) {
+                    ERR_EXIT("Execv error");
+                }
+            }
             snprintf(num_buf, sizeof(num_buf), "%d", player_id[1]);
-            run("./player", child_argv, &pid[1], &files[1][0], NULL);
+            pid[1] = forkAndRedirect(&files[1][0], NULL);
+            if (pid[1] == 0) {
+                // Child
+                fclose(files[0][0]);
+                if (execv("./player", child_argv) < 0) {
+                    ERR_EXIT("Execv error");
+                }
+            }
         } else {
             // Pass player_id to child
             int half = nToRead / 2;
